@@ -1252,6 +1252,7 @@
     box.appendChild(incomingBanner);
 
     function showIncomingCallBanner(callerName) {
+      restoreFromMinIfNeeded();
       incomingBanner.querySelector("#incomingCallerName").textContent = callerName + " is calling...";
       incomingBanner.style.display = "flex";
     }
@@ -1437,6 +1438,13 @@
       };
       makeDraggable(icon, { threshold: 6 });
       return icon;
+    }
+
+    function restoreFromMinIfNeeded() {
+      if (!minIcon) return;
+      removeEl(minIcon); minIcon = null;
+      box.style.display = "flex";
+      chatController.resume();
     }
 
     function minifyChat() {
@@ -2179,7 +2187,7 @@
       ];
 
       async function connectWs() {
-        if (!wsActive || wsPaused) return;
+        if (!wsActive) return;
 
         // Close the old socket before opening a new one.
         // Without this, the DO holds both connections and broadcasts to all of them.
@@ -2203,13 +2211,13 @@
               else if (msg.type && msg.type.startsWith("call-")) handleCallSignal(msg);
             } catch (e) {}
           });
-          ws.addEventListener("close", () => { updateWsIndicator(false); if (wsActive && !wsPaused) scheduleReconnect(); });
+          ws.addEventListener("close", () => { updateWsIndicator(false); if (wsActive) scheduleReconnect(); });
           ws.addEventListener("error", () => {
             updateWsIndicator(false);
             try { ws.close(); } catch (e) {}
-            if (wsActive && !wsPaused) scheduleReconnect();
+            if (wsActive) scheduleReconnect();
           });
-        } catch (e) { if (wsActive && !wsPaused) scheduleReconnect(); }
+        } catch (e) { if (wsActive) scheduleReconnect(); }
       }
 
       function scheduleReconnect() {
@@ -2310,12 +2318,18 @@
         if (wsActive) pollTimer = setTimeout(slowPoll, SLOW_POLL_MS);
       }
 
+      function isCallSignalForMe(msg) {
+        if (!msg.to) return true;
+        return msg.to === username;
+      }
+
       function handleCallSignal(msg) {
         const fromUser = inferSender(msg);
         switch (msg.type) {
           case "call-offer":
             if (!fromUser) return;
             if (isGroupCall) { handleGroupOffer(fromUser, msg.sdp); return; }
+            if (!isCallSignalForMe(msg)) return;
             if (callState) return;
             callState = "incoming"; callPeer = fromUser; pendingOffer = msg.sdp;
             showIncomingCallBanner(fromUser);
@@ -2323,6 +2337,7 @@
 
           case "call-answer":
             if (!fromUser) return;
+            if (!isCallSignalForMe(msg)) return;
             if (isGroupCall) {
               const pd = groupPeers.get(fromUser);
               if (pd && pd.pc) pd.pc.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp: msg.sdp }))
@@ -2339,6 +2354,7 @@
 
           case "call-ice":
             if (!fromUser) return;
+            if (!isCallSignalForMe(msg)) return;
             if (isGroupCall) {
               const pd = groupPeers.get(fromUser);
               if (pd && pd.pc && msg.candidate) {
@@ -2355,6 +2371,7 @@
 
           case "call-end":
           case "call-reject":
+            if (!isCallSignalForMe(msg)) return;
             if (isGroupCall) { if (fromUser) handleGroupPeerLeft(fromUser); return; }
             endCall(msg.type === "call-reject" ? "rejected" : "ended");
             break;
@@ -2470,7 +2487,6 @@
         callState = null; callPeer = null; pendingOffer = null;
         hideCallWindow();
         hideIncomingCallBanner();
-        if (wsPaused) closeWs(); // now safe to close — call is done, chat is still minified
       }
 
       // --- Group call helpers ---
@@ -2532,8 +2548,13 @@
       }
 
       async function handleNewGroupMember(peerName) {
-        if (groupPeers.has(peerName)) return;
-        groupPeers.set(peerName, { pc: null, stream: null, videoEl: null });
+        const existing = groupPeers.get(peerName);
+        if (existing && existing.pc) {
+          const s = existing.pc.iceConnectionState;
+          if (s === "connected" || s === "completed" || s === "checking" || s === "new") return;
+          try { existing.pc.close(); } catch (e) {}
+        }
+        groupPeers.set(peerName, { pc: null, stream: null, videoEl: existing ? existing.videoEl : null });
         if (shouldOffer(username, peerName)) {
           const pc = createPeerConnection(peerName);
           groupPeers.get(peerName).pc = pc;
@@ -2544,7 +2565,6 @@
             sendWs({ type: "call-offer", to: peerName, sdp: offer.sdp });
           } catch (e) { console.error("group offer error:", e); }
         }
-        // else: wait — the other side will offer us (they apply the same rule)
       }
 
       async function handleGroupOffer(peerName, sdp) {
@@ -2584,15 +2604,16 @@
         callState = null; isGroupCall = false; callPeer = null; pendingOffer = null;
         if (groupCallWindow) { try { groupCallWindow.remove(); } catch (e) {} groupCallWindow = null; }
         hideIncomingCallBanner();
-        if (wsPaused) closeWs();
         renderUserList(); // refresh panel to remove join button
       }
 
-      // FIX 3 (core): createPeerConnection with ICE candidate queue + group call routing
-      function createPeerConnection(targetUsername) {
-        const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+      function createPeerConnection(targetUsername, forceRelay) {
+        const rtcConfig = { iceServers: ICE_SERVERS };
+        if (forceRelay) rtcConfig.iceTransportPolicy = "relay";
+        const pc = new RTCPeerConnection(rtcConfig);
         const iceCandidateQueue = [];
         let remoteDescSet = false;
+        pc._forceRelay = !!forceRelay;
 
         async function flushIceCandidates() {
           while (iceCandidateQueue.length) {
@@ -2614,8 +2635,20 @@
           const s = pc.iceConnectionState;
           if (!isGroupCall) {
             if (s === "connected" || s === "completed") { callState = "active"; updateCallStatus("🟢 Connected"); }
-            if (s === "failed")       { updateCallStatus("❌ Connection failed"); endCall("failed"); }
+            if (s === "failed") {
+              if (!pc._forceRelay) {
+                updateCallStatus("⚠️ Retrying via relay...");
+                retryCallWithRelay(targetUsername);
+              } else {
+                updateCallStatus("❌ Connection failed");
+                endCall("failed");
+              }
+            }
             if (s === "disconnected") updateCallStatus("⚠️ Reconnecting...");
+          } else {
+            if (s === "failed" && !pc._forceRelay) {
+              retryGroupPeerWithRelay(targetUsername);
+            }
           }
         };
         pc.ontrack = (e) => {
@@ -2636,6 +2669,33 @@
           }
         };
         return pc;
+      }
+
+      async function retryCallWithRelay(targetUsername) {
+        if (peerConnection) { try { peerConnection.close(); } catch (e) {} }
+        try {
+          peerConnection = createPeerConnection(targetUsername, true);
+          if (_localStream) _localStream.getTracks().forEach(t => peerConnection.addTrack(t, _localStream));
+          const offer = await peerConnection.createOffer({ iceRestart: true });
+          await peerConnection.setLocalDescription(offer);
+          sendWs({ type: "call-offer", to: targetUsername, sdp: offer.sdp });
+        } catch (e) { console.error("retryCallWithRelay error:", e); endCall("failed"); }
+      }
+
+      async function retryGroupPeerWithRelay(peerName) {
+        const pd = groupPeers.get(peerName);
+        if (pd && pd.pc) { try { pd.pc.close(); } catch (e) {} }
+        if (!pd) return;
+        const pc = createPeerConnection(peerName, true);
+        pd.pc = pc;
+        if (_localStream) _localStream.getTracks().forEach(t => pc.addTrack(t, _localStream));
+        if (shouldOffer(username, peerName)) {
+          try {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            sendWs({ type: "call-offer", to: peerName, sdp: offer.sdp });
+          } catch (e) { console.error("retryGroupPeerWithRelay error:", e); }
+        }
       }
 
       const ctrl = {
@@ -2725,7 +2785,7 @@
         },
         pause() {
           wsPaused = true;
-          if (!callState) closeWs(); // keep WS alive if a call is in progress
+          // Keep WS alive so incoming call signals can still be received while minimized
           if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
         },
         resume() {
